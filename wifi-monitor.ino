@@ -18,8 +18,8 @@
 Adafruit_NeoPixel pixels(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
 // Traffic limits
-#define LOW_TRAFFIC 25
-#define HIGH_TRAFFIC 75
+#define LOW_TRAFFIC 800
+#define HIGH_TRAFFIC 1500
 
 // --- FADE VARIABLES ---
 int currentR = 0, currentG = 0, currentB = 0;
