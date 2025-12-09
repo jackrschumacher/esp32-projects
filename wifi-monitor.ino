@@ -11,15 +11,15 @@
 #define WIFI_CHANNEL 1
 
 // --- LOGGING CONFIGURATION ---
-#define LOG_INTERVAL_MS 3600000 // 1 Hour (3,600,000 ms)
+#define LOG_INTERVAL_MS 3600000 // 1 Hour
 // #define LOG_INTERVAL_MS 60000 // Uncomment for testing (1 Minute)
 
 // Setup the NeoPixel library
 Adafruit_NeoPixel pixels(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
 // Traffic limits
-#define LOW_TRAFFIC 50
-#define HIGH_TRAFFIC 200
+#define LOW_TRAFFIC 25
+#define HIGH_TRAFFIC 75
 
 // --- FADE VARIABLES ---
 int currentR = 0, currentG = 0, currentB = 0;
@@ -27,16 +27,16 @@ int targetR = 0, targetG = 0, targetB = 0;
 int fadeSpeed = 5; 
 
 // --- COUNTERS ---
-volatile int packetCount = 0;      // Counts packets for the immediate LED update
-unsigned long hourTotalPackets = 0;// Accumulates packets for the whole hour
-int hourCounter = 1;               // Tracks which hour we are on
+volatile int packetCount = 0;      
+unsigned long hourTotalPackets = 0;
+int hourCounter = 1;               
 
 // --- TIMERS ---
 unsigned long lastTrafficCheck = 0;
 unsigned long lastFadeUpdate = 0;
 unsigned long lastLogTime = 0;
 
-int trafficInterval = 1000; 
+int trafficInterval = 10000; 
 
 // Sniffer Callback
 void promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
@@ -69,7 +69,7 @@ void readFile(const char * path){
 
 void setup() {
   Serial.begin(115200);
-  delay(1000); // Wait for Serial to wake up
+  delay(1000); 
 
   // 1. Initialize File System
   if(!LittleFS.begin(true)){
@@ -105,11 +105,7 @@ void loop() {
 
   // --- PART 1: HOURLY LOGGING ---
   if (currentMillis - lastLogTime > LOG_INTERVAL_MS) {
-    
-    // Calculate Average (Total / Seconds in an hour)
     float avgPerSec = hourTotalPackets / (LOG_INTERVAL_MS / 1000.0);
-    
-    // Create the data string: "1, 45000, 12.5"
     String logEntry = String(hourCounter) + ", " + 
                       String(hourTotalPackets) + ", " + 
                       String(avgPerSec, 2) + "\n";
@@ -117,47 +113,59 @@ void loop() {
     Serial.print("SAVING LOG: "); Serial.print(logEntry);
     appendFile("/traffic_log.txt", logEntry);
 
-    // Reset long-term counters
     hourTotalPackets = 0;
     hourCounter++;
     lastLogTime = currentMillis;
   }
 
-  // --- PART 2: LED LOGIC (Set the Target Color) ---
+  // --- PART 2: LED LOGIC & SERIAL STATS (Every 1 Sec) ---
   if (currentMillis - lastTrafficCheck > trafficInterval) {
     
-    // Capture the count safely and reset it immediately
+    // Capture counters
     int currentPackets = packetCount; 
     packetCount = 0; 
-
-    // Add this batch to the hourly total
     hourTotalPackets += currentPackets;
 
-    Serial.printf("Packet count (last sec): %d | Hour Total: %lu\n", currentPackets, hourTotalPackets);
+    // --- SYSTEM STATS ---
+    // RAM
+    uint32_t freeHeap = ESP.getFreeHeap();
+    uint32_t totalHeap = ESP.getHeapSize();
+    float ramPercent = (float)freeHeap / totalHeap * 100;
 
-    // Determine LED Color based on intensity
+    // STORAGE
+    uint32_t usedBytes = LittleFS.usedBytes();
+    uint32_t totalBytes = LittleFS.totalBytes();
+    float storagePercent = (float)usedBytes / totalBytes * 100;
+
+    // CPU TEMP
+    float cpuTemp = temperatureRead();
+
+    // Print Dashboard
+    Serial.println("------------------------------------------------");
+    Serial.printf("TRAFFIC: %d pkts/sec | Hour Total: %lu\n", currentPackets, hourTotalPackets);
+    Serial.printf("SYSTEM : CPU: %.1f°C | RAM Free: %d B (%.1f%%)\n", cpuTemp, freeHeap, ramPercent);
+    Serial.printf("STORAGE: Used: %d / %d B (%.1f%%)\n", usedBytes, totalBytes, storagePercent);
+    Serial.println("------------------------------------------------");
+
+    // Determine LED Color
     if (currentPackets == 0) {
       targetR = 0; targetG = 0; targetB = 0;
     } 
     else if (currentPackets < LOW_TRAFFIC) {
-      // Green
       targetR = 0; targetG = 255; targetB = 0;
     } 
     else if (currentPackets < HIGH_TRAFFIC) {
-      // Yellow
       targetR = 255; targetG = 180; targetB = 0;
     } 
     else {
-      // Red
       targetR = 255; targetG = 0; targetB = 0;
     }
 
     lastTrafficCheck = currentMillis;
   }
 
-  // --- PART 3: ANIMATION (Chase the Target) ---
+  // --- PART 3: ANIMATION ---
   if (currentMillis - lastFadeUpdate > 10) {
-    
     if (currentR < targetR) currentR += fadeSpeed;
     if (currentR > targetR) currentR -= fadeSpeed;
     if (abs(currentR - targetR) < fadeSpeed) currentR = targetR; 
