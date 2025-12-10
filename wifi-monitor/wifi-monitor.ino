@@ -11,13 +11,8 @@
 #define NUMPIXELS 1
 #define WIFI_CHANNEL 1
 
-// --- LOGGING CONFIG (15 MINUTES) ---
-#define LOG_INTERVAL_MS 900000 
-// #define LOG_INTERVAL_MS 60000 // Uncomment for testing (1 min)
-
-// --- TRAFFIC LIMITS ---
-#define LOW_TRAFFIC 400
-#define HIGH_TRAFFIC 800
+// --- LOGGING CONFIG ---
+#define LOG_INTERVAL_MS 60000 // Log every 1 Minute to build history faster
 
 // --- OBJECTS ---
 Adafruit_NeoPixel pixels(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
@@ -25,7 +20,16 @@ Adafruit_NeoPixel pixels(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 // --- VARIABLES ---
 volatile int packetCount = 0;      
 unsigned long intervalTotalPackets = 0; 
-int intervalCounter = 1;                  
+
+// --- SMART HISTORY BUFFER (Last 15 Minutes) ---
+long history[15]; // Stores the packet count for each of the last 15 minutes
+int historyIndex = 0;
+bool historyFull = false;
+
+// --- DYNAMIC THRESHOLDS (Self-Learning) ---
+// These will change automatically based on your environment!
+long dynamicLow = 200;  // Default starting value
+long dynamicHigh = 800; // Default starting value
 
 // --- FADE VARS ---
 int currentR = 0, currentG = 0, currentB = 0;
@@ -42,53 +46,37 @@ void promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
   packetCount++;
 }
 
-// --- REPORT GENERATOR ---
-void generateReport() {
-  if (!LittleFS.exists("/traffic_log.txt")) return;
+// --- SMART CALIBRATION FUNCTION ---
+void calibrateThresholds() {
+  // If we don't have enough data yet, stick to defaults
+  if (historyIndex == 0 && !historyFull) return;
 
-  File file = LittleFS.open("/traffic_log.txt", "r");
-  if (!file) return;
+  long minVal = 999999;
+  long maxVal = 0;
+  int count = historyFull ? 15 : historyIndex;
 
-  long maxPackets = 1; 
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    if (line.length() < 2) continue;
-    int firstComma = line.indexOf(',');
-    int secondComma = line.indexOf(',', firstComma + 1);
-    if (firstComma > 0 && secondComma > 0) {
-      String totalStr = line.substring(firstComma + 1, secondComma);
-      long total = totalStr.toInt();
-      if (total > maxPackets) maxPackets = total;
-    }
+  // 1. Find the Min and Max in our history buffer
+  for (int i = 0; i < count; i++) {
+    if (history[i] < minVal) minVal = history[i];
+    if (history[i] > maxVal) maxVal = history[i];
   }
-  file.close(); 
 
-  file = LittleFS.open("/traffic_log.txt", "r");
-  // Note: These print statements will look like "noise" on the Plotter
-  // but are readable in the Serial Monitor.
-  Serial.println("\n\n===== 15-MINUTE INTERVAL REPORT =====");
-  Serial.printf("Scale: 100%% = %ld packets\n", maxPackets);
-  Serial.println("-------------------------------------");
-
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    if (line.length() < 2) continue;
-    int firstComma = line.indexOf(',');
-    int secondComma = line.indexOf(',', firstComma + 1);
-    if (firstComma > 0) {
-      String idStr = line.substring(0, firstComma);
-      String totalStr = line.substring(firstComma + 1, secondComma);
-      long total = totalStr.toInt();
-      int barLength = (int)((total * 50) / maxPackets);
-      Serial.printf("Int %-3s |", idStr.c_str());
-      for (int i = 0; i < barLength; i++) Serial.print("#");
-      Serial.printf(" (%ld)\n", total);
-    }
+  // Avoid divide by zero or ranges that are too tight
+  if (maxVal - minVal < 50) {
+    maxVal = minVal + 50; 
   }
-  Serial.println("=====================================\n");
-  file.close();
+
+  // 2. Set Limits based on relative range
+  // Low (Green) is the bottom 33% of the range
+  // High (Red) is the top 66% of the range
+  dynamicLow = minVal + ((maxVal - minVal) * 0.33);
+  dynamicHigh = minVal + ((maxVal - minVal) * 0.66);
+
+  Serial.printf(">> RE-CALIBRATING: Min History: %ld | Max History: %ld\n", minVal, maxVal);
+  Serial.printf(">> NEW THRESHOLDS: Green < %ld | Red > %ld\n", dynamicLow, dynamicHigh);
 }
 
+// --- FILE HELPERS ---
 void appendFile(const char * path, String message){
   File file = LittleFS.open(path, FILE_APPEND);
   if(!file) return;
@@ -111,14 +99,17 @@ void setup() {
   pixels.setBrightness(20);
   pixels.show();
 
+  // Initialize History Buffer with 0
+  for(int i=0; i<15; i++) history[i] = 0;
+
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(promiscuous_rx_cb);
   esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
-  // Short delay before starting to avoid plotting startup text
-  delay(500);
+  Serial.println("--- Adaptive Traffic Monitor Started ---");
+  Serial.println("Learning environment... thresholds will adjust every minute.");
   
   lastLogTime = millis();
 }
@@ -126,63 +117,60 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
 
-  // --- BUTTON CHECK ---
-  if (digitalRead(BUTTON_PIN) == LOW) {
-    delay(50); 
-    if (digitalRead(BUTTON_PIN) == LOW) {
-      pixels.setPixelColor(0, pixels.Color(0, 0, 255));
-      pixels.show();
-      generateReport();
-      while(digitalRead(BUTTON_PIN) == LOW) delay(10);
-      lastFadeUpdate = 0; 
-    }
-  }
-
-  // --- PART 1: LOGGING ---
+  // --- PART 1: LOGGING & LEARNING (Every Minute) ---
   if (currentMillis - lastLogTime > LOG_INTERVAL_MS) {
-    float avgPerSec = intervalTotalPackets / (LOG_INTERVAL_MS / 1000.0);
-    String logEntry = String(intervalCounter) + ", " + 
-                      String(intervalTotalPackets) + ", " + 
-                      String(avgPerSec, 2) + "\n";
-    
-    // Minimal print to avoid messing up graph too much
-    // Serial.print("SAVING"); 
+    // 1. Calculate Per-Second Average for this minute
+    // Since LOG_INTERVAL is 60000ms, we divide total by 60
+    long avgPerSec = intervalTotalPackets / 60;
+
+    // 2. Store in History Buffer
+    history[historyIndex] = avgPerSec;
+    historyIndex++;
+    if (historyIndex >= 15) {
+      historyIndex = 0; // Wrap around (Circular Buffer)
+      historyFull = true;
+    }
+
+    // 3. Log to file
+    String logEntry = String(millis()/1000) + "," + String(avgPerSec) + "\n";
     appendFile("/traffic_log.txt", logEntry);
-    
-    // Auto-generate report (will create a gap in the graph)
-    generateReport(); 
-    
+
+    // 4. *** MAGIC HAPPENS HERE ***
+    // Recalculate what "Loud" and "Quiet" mean based on new data
+    calibrateThresholds();
+
     intervalTotalPackets = 0;
-    intervalCounter++;
     lastLogTime = currentMillis;
   }
 
-  // --- PART 2: LIVE PLOTTER OUTPUT ---
+  // --- PART 2: LIVE PLOTTER (Every 1 Sec) ---
   if (currentMillis - lastTrafficCheck > 1000) {
     int currentPackets = packetCount; 
     packetCount = 0; 
-    intervalTotalPackets += currentPackets;
+    intervalTotalPackets += currentPackets; // Add to the minute-total
 
-    // --- SYSTEM STATS ---
+    // Stats
     uint32_t freeHeap = ESP.getFreeHeap();
     float cpuTemp = temperatureRead();
     
-    // --- PLOTTER FORMAT ---
-    // Syntax: Label:Value, Label:Value
-    // FreeRAM is divided by 1024 to convert Bytes to KB (Scaling for graph)
-    Serial.printf("Traffic:%d, Temp:%.1f, FreeRAM_KB:%.1f\n", 
-                  currentPackets, cpuTemp, freeHeap / 1024.0);
+    Serial.printf("Traffic:%d, Temp:%.1f\n", 
+                  currentPackets, cpuTemp);
 
-    // Determine Color
+    // --- ADAPTIVE LED LOGIC ---
+    // Uses the DYNAMIC variables instead of hardcoded defines
     if (currentPackets == 0) {
       targetR = 0; targetG = 0; targetB = 0;
-    } else if (currentPackets < LOW_TRAFFIC) {
-      targetR = 0; targetG = 255; targetB = 0; 
-    } else if (currentPackets < HIGH_TRAFFIC) {
-      targetR = 255; targetG = 180; targetB = 0; 
-    } else {
-      targetR = 255; targetG = 0; targetB = 0; 
+    } 
+    else if (currentPackets < dynamicLow) {
+      targetR = 0; targetG = 255; targetB = 0; // Green (Below 33%)
+    } 
+    else if (currentPackets < dynamicHigh) {
+      targetR = 255; targetG = 180; targetB = 0; // Yellow (Middle 33%)
+    } 
+    else {
+      targetR = 255; targetG = 0; targetB = 0; // Red (Top 33%)
     }
+
     lastTrafficCheck = currentMillis;
   }
 
