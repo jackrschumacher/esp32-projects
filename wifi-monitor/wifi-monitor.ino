@@ -11,15 +11,15 @@
 #define WIFI_CHANNEL 1
 
 // --- LOGGING CONFIGURATION ---
-#define LOG_INTERVAL_MS 900 // 15 minutes
+#define LOG_INTERVAL_MS 900000 // 15 minutes
 // #define LOG_INTERVAL_MS 60000 // Uncomment for testing (1 Minute)
 
 // Setup the NeoPixel library
 Adafruit_NeoPixel pixels(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
 // Traffic limits
-#define LOW_TRAFFIC 25
-#define HIGH_TRAFFIC 95
+#define LOW_TRAFFIC 200
+#define HIGH_TRAFFIC 400
 
 // --- FADE VARIABLES ---
 int currentR = 0, currentG = 0, currentB = 0;
