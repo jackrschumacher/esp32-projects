@@ -12,7 +12,7 @@
 #define WIFI_CHANNEL 1
 
 // --- LOGGING CONFIG ---
-#define LOG_INTERVAL_MS 60000 // Log every 1 Minute to build history faster
+#define LOG_INTERVAL_MS 900000 
 
 // --- OBJECTS ---
 Adafruit_NeoPixel pixels(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
@@ -22,14 +22,13 @@ volatile int packetCount = 0;
 unsigned long intervalTotalPackets = 0; 
 
 // --- SMART HISTORY BUFFER (Last 15 Minutes) ---
-long history[15]; // Stores the packet count for each of the last 15 minutes
+long history[15];
 int historyIndex = 0;
 bool historyFull = false;
 
 // --- DYNAMIC THRESHOLDS (Self-Learning) ---
-// These will change automatically based on your environment!
-long dynamicLow = 200;  // Default starting value
-long dynamicHigh = 800; // Default starting value
+long dynamicLow = 200;  
+long dynamicHigh = 800; 
 
 // --- FADE VARS ---
 int currentR = 0, currentG = 0, currentB = 0;
@@ -48,32 +47,73 @@ void promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
 
 // --- SMART CALIBRATION FUNCTION ---
 void calibrateThresholds() {
-  // If we don't have enough data yet, stick to defaults
   if (historyIndex == 0 && !historyFull) return;
 
   long minVal = 999999;
   long maxVal = 0;
   int count = historyFull ? 15 : historyIndex;
 
-  // 1. Find the Min and Max in our history buffer
   for (int i = 0; i < count; i++) {
     if (history[i] < minVal) minVal = history[i];
     if (history[i] > maxVal) maxVal = history[i];
   }
 
-  // Avoid divide by zero or ranges that are too tight
   if (maxVal - minVal < 50) {
     maxVal = minVal + 50; 
   }
 
-  // 2. Set Limits based on relative range
-  // Low (Green) is the bottom 33% of the range
-  // High (Red) is the top 66% of the range
   dynamicLow = minVal + ((maxVal - minVal) * 0.33);
   dynamicHigh = minVal + ((maxVal - minVal) * 0.66);
+}
 
-  Serial.printf(">> RE-CALIBRATING: Min History: %ld | Max History: %ld\n", minVal, maxVal);
-  Serial.printf(">> NEW THRESHOLDS: Green < %ld | Red > %ld\n", dynamicLow, dynamicHigh);
+// --- REPORT GENERATOR ---
+void generateReport() {
+  if (!LittleFS.exists("/traffic_log.txt")) {
+    Serial.println("No logs found yet.");
+    return;
+  }
+
+  File file = LittleFS.open("/traffic_log.txt", "r");
+  if (!file) return;
+
+  // PASS 1: Find Max for scaling
+  long maxPackets = 1; 
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    if (line.length() < 2) continue;
+    int comma = line.indexOf(',');
+    if (comma > 0) {
+      String valStr = line.substring(comma + 1);
+      long val = valStr.toInt();
+      if (val > maxPackets) maxPackets = val;
+    }
+  }
+  file.close(); 
+
+  // PASS 2: Print Graph
+  file = LittleFS.open("/traffic_log.txt", "r");
+  Serial.println("\n\n===== TRAFFIC HISTORY GRAPH =====");
+  Serial.printf("Scale: 100%% = %ld packets/sec (avg)\n", maxPackets);
+  Serial.println("-------------------------------------");
+
+  int lineCount = 1;
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    if (line.length() < 2) continue;
+    
+    int comma = line.indexOf(',');
+    if (comma > 0) {
+      String valStr = line.substring(comma + 1);
+      long val = valStr.toInt();
+      int barLength = (int)((val * 50) / maxPackets);
+      
+      Serial.printf("%03d |", lineCount++);
+      for (int i = 0; i < barLength; i++) Serial.print("#");
+      Serial.printf(" (%ld)\n", val);
+    }
+  }
+  Serial.println("=====================================\n");
+  file.close();
 }
 
 // --- FILE HELPERS ---
@@ -108,8 +148,9 @@ void setup() {
   esp_wifi_set_promiscuous_rx_cb(promiscuous_rx_cb);
   esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
-  Serial.println("--- Adaptive Traffic Monitor Started ---");
-  Serial.println("Learning environment... thresholds will adjust every minute.");
+  Serial.println("--- Adaptive Monitor Started ---");
+  Serial.println("Type 'graph' or press BOOT button to see history.");
+  Serial.println("System is learning thresholds...");
   
   lastLogTime = millis();
 }
@@ -117,64 +158,93 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
 
-  // --- PART 1: LOGGING & LEARNING (Every Minute) ---
+  // --- 1. SERIAL COMMAND LISTENER ---
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim(); 
+    
+    if (command.equalsIgnoreCase("graph")) {
+      pixels.setPixelColor(0, pixels.Color(0, 0, 255)); 
+      pixels.show();
+      generateReport();
+    }
+    else if (command.equalsIgnoreCase("thresholds")) {
+      Serial.printf("Low < %ld | High > %ld\n", dynamicLow, dynamicHigh );
+    }
+    else if (command.equalsIgnoreCase("system")) {
+      // --- SYSTEM STATS ---
+      uint32_t freeHeap = ESP.getFreeHeap();
+      float cpuTemp = temperatureRead();
+      
+      // Calculate Storage Used Percentage
+      uint32_t usedBytes = LittleFS.usedBytes();
+      uint32_t totalBytes = LittleFS.totalBytes();
+      float storagePercent = (float)usedBytes / totalBytes * 100;
+      Serial.printf("Temp:%.1f C, FreeRAM:%.1f KB, Storage_Percent:%.1f\n",
+      cpuTemp, freeHeap/ 1024.0, storagePercent);
+    }
+  }
+
+  // --- 2. BUTTON LISTENER ---
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    delay(50); 
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      pixels.setPixelColor(0, pixels.Color(0, 0, 255)); 
+      pixels.show();
+      generateReport();
+      while(digitalRead(BUTTON_PIN) == LOW) delay(10);
+    }
+  }
+
+  // --- 3. LOGGING & LEARNING (Every Minute) ---
   if (currentMillis - lastLogTime > LOG_INTERVAL_MS) {
-    // 1. Calculate Per-Second Average for this minute
-    // Since LOG_INTERVAL is 60000ms, we divide total by 60
     long avgPerSec = intervalTotalPackets / 60;
 
-    // 2. Store in History Buffer
     history[historyIndex] = avgPerSec;
     historyIndex++;
     if (historyIndex >= 15) {
-      historyIndex = 0; // Wrap around (Circular Buffer)
+      historyIndex = 0; 
       historyFull = true;
     }
 
-    // 3. Log to file
     String logEntry = String(millis()/1000) + "," + String(avgPerSec) + "\n";
     appendFile("/traffic_log.txt", logEntry);
 
-    // 4. *** MAGIC HAPPENS HERE ***
-    // Recalculate what "Loud" and "Quiet" mean based on new data
     calibrateThresholds();
 
     intervalTotalPackets = 0;
     lastLogTime = currentMillis;
   }
 
-  // --- PART 2: LIVE PLOTTER (Every 1 Sec) ---
+  // --- 4. LIVE PLOTTER (Every 1 Sec) ---
   if (currentMillis - lastTrafficCheck > 1000) {
     int currentPackets = packetCount; 
     packetCount = 0; 
-    intervalTotalPackets += currentPackets; // Add to the minute-total
+    intervalTotalPackets += currentPackets; 
 
-    // Stats
-    uint32_t freeHeap = ESP.getFreeHeap();
-    float cpuTemp = temperatureRead();
     
-    Serial.printf("Traffic:%d, Temp:%.1f\n", 
-                  currentPackets, cpuTemp);
 
-    // --- ADAPTIVE LED LOGIC ---
-    // Uses the DYNAMIC variables instead of hardcoded defines
+   
+    Serial.printf("Traffic:%d pckts/sec \n", currentPackets);
+
+    // Adaptive LED Logic
     if (currentPackets == 0) {
       targetR = 0; targetG = 0; targetB = 0;
     } 
     else if (currentPackets < dynamicLow) {
-      targetR = 0; targetG = 255; targetB = 0; // Green (Below 33%)
+      targetR = 0; targetG = 255; targetB = 0; 
     } 
     else if (currentPackets < dynamicHigh) {
-      targetR = 255; targetG = 180; targetB = 0; // Yellow (Middle 33%)
+      targetR = 255; targetG = 180; targetB = 0; 
     } 
     else {
-      targetR = 255; targetG = 0; targetB = 0; // Red (Top 33%)
+      targetR = 255; targetG = 0; targetB = 0; 
     }
 
     lastTrafficCheck = currentMillis;
   }
 
-  // --- PART 3: ANIMATION ---
+  // --- 5. ANIMATION ---
   if (currentMillis - lastFadeUpdate > 10) {
     if (currentR < targetR) currentR += fadeSpeed;
     if (currentR > targetR) currentR -= fadeSpeed;
