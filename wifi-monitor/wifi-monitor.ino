@@ -5,65 +5,94 @@
 #include <FS.h>
 #include <LittleFS.h>
 
-// --- IMPORTANT: PIN CONFIGURATION ---
+// --- HARDWARE CONFIG ---
 #define RGB_PIN 48  
+#define BUTTON_PIN 0  
 #define NUMPIXELS 1
 #define WIFI_CHANNEL 1
 
-// --- LOGGING CONFIGURATION ---
-#define LOG_INTERVAL_MS 900000 // 15 minutes
-// #define LOG_INTERVAL_MS 60000 // Uncomment for testing (1 Minute)
+// --- LOGGING CONFIG (15 MINUTES) ---
+#define LOG_INTERVAL_MS 900000 
+// #define LOG_INTERVAL_MS 60000 // Uncomment for testing (1 min)
 
-// Setup the NeoPixel library
+// --- TRAFFIC LIMITS ---
+#define LOW_TRAFFIC 400
+#define HIGH_TRAFFIC 800
+
+// --- OBJECTS ---
 Adafruit_NeoPixel pixels(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
-// Traffic limits
-#define LOW_TRAFFIC 200
-#define HIGH_TRAFFIC 400
+// --- VARIABLES ---
+volatile int packetCount = 0;      
+unsigned long intervalTotalPackets = 0; 
+int intervalCounter = 1;                  
 
-// --- FADE VARIABLES ---
+// --- FADE VARS ---
 int currentR = 0, currentG = 0, currentB = 0;
 int targetR = 0, targetG = 0, targetB = 0;
 int fadeSpeed = 5; 
-
-// --- COUNTERS ---
-volatile int packetCount = 0;      
-unsigned long hourTotalPackets = 0;
-int hourCounter = 1;               
 
 // --- TIMERS ---
 unsigned long lastTrafficCheck = 0;
 unsigned long lastFadeUpdate = 0;
 unsigned long lastLogTime = 0;
 
-int trafficInterval = 1000; 
-
 // Sniffer Callback
 void promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
   packetCount++;
 }
 
-// --- FILE SYSTEM HELPERS ---
-void appendFile(const char * path, String message){
-  File file = LittleFS.open(path, FILE_APPEND);
-  if(!file){
-    Serial.println("- failed to open file for appending");
-    return;
+// --- REPORT GENERATOR ---
+void generateReport() {
+  if (!LittleFS.exists("/traffic_log.txt")) return;
+
+  File file = LittleFS.open("/traffic_log.txt", "r");
+  if (!file) return;
+
+  long maxPackets = 1; 
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    if (line.length() < 2) continue;
+    int firstComma = line.indexOf(',');
+    int secondComma = line.indexOf(',', firstComma + 1);
+    if (firstComma > 0 && secondComma > 0) {
+      String totalStr = line.substring(firstComma + 1, secondComma);
+      long total = totalStr.toInt();
+      if (total > maxPackets) maxPackets = total;
+    }
   }
-  file.print(message);
+  file.close(); 
+
+  file = LittleFS.open("/traffic_log.txt", "r");
+  // Note: These print statements will look like "noise" on the Plotter
+  // but are readable in the Serial Monitor.
+  Serial.println("\n\n===== 15-MINUTE INTERVAL REPORT =====");
+  Serial.printf("Scale: 100%% = %ld packets\n", maxPackets);
+  Serial.println("-------------------------------------");
+
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    if (line.length() < 2) continue;
+    int firstComma = line.indexOf(',');
+    int secondComma = line.indexOf(',', firstComma + 1);
+    if (firstComma > 0) {
+      String idStr = line.substring(0, firstComma);
+      String totalStr = line.substring(firstComma + 1, secondComma);
+      long total = totalStr.toInt();
+      int barLength = (int)((total * 50) / maxPackets);
+      Serial.printf("Int %-3s |", idStr.c_str());
+      for (int i = 0; i < barLength; i++) Serial.print("#");
+      Serial.printf(" (%ld)\n", total);
+    }
+  }
+  Serial.println("=====================================\n");
   file.close();
 }
 
-void readFile(const char * path){
-  Serial.printf("Reading file: %s\r\n", path);
-  File file = LittleFS.open(path);
-  if(!file || file.isDirectory()){
-    Serial.println("- failed to open file for reading");
-    return;
-  }
-  while(file.available()){
-    Serial.write(file.read());
-  }
+void appendFile(const char * path, String message){
+  File file = LittleFS.open(path, FILE_APPEND);
+  if(!file) return;
+  file.print(message);
   file.close();
 }
 
@@ -71,96 +100,89 @@ void setup() {
   Serial.begin(115200);
   delay(1000); 
 
-  // 1. Initialize File System
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
   if(!LittleFS.begin(true)){
     Serial.println("LittleFS Mount Failed");
     return;
   }
 
-  // 2. Print existing history to Serial on boot
-  Serial.println("\n--- HISTORY LOG (Copy to CSV) ---");
-  Serial.println("Hour, Total_Packets, Avg_Packets_Per_Sec");
-  readFile("/traffic_log.txt");
-  Serial.println("--- END HISTORY ---");
-
-  // 3. Initialize LED
   pixels.begin();
   pixels.setBrightness(20);
-  pixels.clear();
   pixels.show();
 
-  // 4. Initialize WiFi Sniffer
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(promiscuous_rx_cb);
   esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
-  Serial.println("--- RGB Traffic Monitor & Logger Started ---");
+  // Short delay before starting to avoid plotting startup text
+  delay(500);
+  
   lastLogTime = millis();
 }
 
 void loop() {
   unsigned long currentMillis = millis();
 
-  // --- PART 1: HOURLY LOGGING ---
+  // --- BUTTON CHECK ---
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    delay(50); 
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      pixels.setPixelColor(0, pixels.Color(0, 0, 255));
+      pixels.show();
+      generateReport();
+      while(digitalRead(BUTTON_PIN) == LOW) delay(10);
+      lastFadeUpdate = 0; 
+    }
+  }
+
+  // --- PART 1: LOGGING ---
   if (currentMillis - lastLogTime > LOG_INTERVAL_MS) {
-    float avgPerSec = hourTotalPackets / (LOG_INTERVAL_MS / 1000.0);
-    String logEntry = String(hourCounter) + ", " + 
-                      String(hourTotalPackets) + ", " + 
+    float avgPerSec = intervalTotalPackets / (LOG_INTERVAL_MS / 1000.0);
+    String logEntry = String(intervalCounter) + ", " + 
+                      String(intervalTotalPackets) + ", " + 
                       String(avgPerSec, 2) + "\n";
     
-    Serial.print("SAVING LOG: "); Serial.print(logEntry);
+    // Minimal print to avoid messing up graph too much
+    // Serial.print("SAVING"); 
     appendFile("/traffic_log.txt", logEntry);
-
-    hourTotalPackets = 0;
-    hourCounter++;
+    
+    // Auto-generate report (will create a gap in the graph)
+    generateReport(); 
+    
+    intervalTotalPackets = 0;
+    intervalCounter++;
     lastLogTime = currentMillis;
   }
 
-  // --- PART 2: LED LOGIC & SERIAL STATS (Every 1 Sec) ---
-  if (currentMillis - lastTrafficCheck > trafficInterval) {
-    
-    // Capture counters
+  // --- PART 2: LIVE PLOTTER OUTPUT ---
+  if (currentMillis - lastTrafficCheck > 1000) {
     int currentPackets = packetCount; 
     packetCount = 0; 
-    hourTotalPackets += currentPackets;
+    intervalTotalPackets += currentPackets;
 
     // --- SYSTEM STATS ---
-    // RAM
     uint32_t freeHeap = ESP.getFreeHeap();
-    uint32_t totalHeap = ESP.getHeapSize();
-    float ramPercent = (float)freeHeap / totalHeap * 100;
-
-    // STORAGE
-    uint32_t usedBytes = LittleFS.usedBytes();
-    uint32_t totalBytes = LittleFS.totalBytes();
-    float storagePercent = (float)usedBytes / totalBytes * 100;
-
-    // CPU TEMP
     float cpuTemp = temperatureRead();
+    
+    // --- PLOTTER FORMAT ---
+    // Syntax: Label:Value, Label:Value
+    // FreeRAM is divided by 1024 to convert Bytes to KB (Scaling for graph)
+    Serial.printf("Traffic:%d, Temp:%.1f, FreeRAM_KB:%.1f\n", 
+                  currentPackets, cpuTemp, freeHeap / 1024.0);
 
-    // Print Dashboard
-    Serial.println("------------------------------------------------");
-    Serial.printf("TRAFFIC: %d pkts/sec | Hour Total: %lu\n", currentPackets, hourTotalPackets);
-    Serial.printf("SYSTEM : CPU: %.1f°C | RAM Free: %d B (%.1f%%)\n", cpuTemp, freeHeap, ramPercent);
-    Serial.printf("STORAGE: Used: %d / %d B (%.1f%%)\n", usedBytes, totalBytes, storagePercent);
-    Serial.println("------------------------------------------------");
-
-    // Determine LED Color
+    // Determine Color
     if (currentPackets == 0) {
       targetR = 0; targetG = 0; targetB = 0;
-    } 
-    else if (currentPackets < LOW_TRAFFIC) {
-      targetR = 0; targetG = 255; targetB = 0;
-    } 
-    else if (currentPackets < HIGH_TRAFFIC) {
-      targetR = 255; targetG = 180; targetB = 0;
-    } 
-    else {
-      targetR = 255; targetG = 0; targetB = 0;
+    } else if (currentPackets < LOW_TRAFFIC) {
+      targetR = 0; targetG = 255; targetB = 0; 
+    } else if (currentPackets < HIGH_TRAFFIC) {
+      targetR = 255; targetG = 180; targetB = 0; 
+    } else {
+      targetR = 255; targetG = 0; targetB = 0; 
     }
-
     lastTrafficCheck = currentMillis;
   }
 
@@ -180,7 +202,6 @@ void loop() {
 
     pixels.setPixelColor(0, pixels.Color(currentR, currentG, currentB));
     pixels.show();
-    
     lastFadeUpdate = currentMillis;
   }
 }
