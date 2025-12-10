@@ -11,15 +11,15 @@
 #define WIFI_CHANNEL 1
 
 // --- LOGGING CONFIGURATION ---
-#define LOG_INTERVAL_MS 3600000 // 1 Hour
+#define LOG_INTERVAL_MS 900 // 15 minutes
 // #define LOG_INTERVAL_MS 60000 // Uncomment for testing (1 Minute)
 
 // Setup the NeoPixel library
 Adafruit_NeoPixel pixels(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
 // Traffic limits
-#define LOW_TRAFFIC 800
-#define HIGH_TRAFFIC 1500
+#define LOW_TRAFFIC 25
+#define HIGH_TRAFFIC 95
 
 // --- FADE VARIABLES ---
 int currentR = 0, currentG = 0, currentB = 0;
@@ -36,7 +36,7 @@ unsigned long lastTrafficCheck = 0;
 unsigned long lastFadeUpdate = 0;
 unsigned long lastLogTime = 0;
 
-int trafficInterval = 10000; 
+int trafficInterval = 1000; 
 
 // Sniffer Callback
 void promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
