@@ -1,182 +1,218 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include <LittleFS.h>
-#include "esp_wifi.h"
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
 #include <set>
+#include <Adafruit_NeoPixel.h>
 
 // ================= CONFIGURATION =================
-const unsigned long SAVE_INTERVAL_MS = 15 * 60 * 1000;  // Save to storage every 15 Mins
-const unsigned long STATUS_INTERVAL_MS = 0.5 * 60 * 1000; // Print status every 2 Mins
-const char* DATA_PATH = "/readings.txt";
+const char* WIFI_SSID = "ESP32_BLE_Counter";
+const char* WIFI_PASS = "12345678";
+const char* DATA_PATH = "/ble_readings.txt";
+
+// --- HARDWARE ---
+#define NEOPIXEL_PIN  48  
+#define NUM_PIXELS    1
+#define BRIGHTNESS    20
+#define BUTTON_PIN    0   
+
+// --- TIMING ---
+const unsigned long SAVE_INTERVAL_MS = 15 * 60 * 1000; // Save every 15 mins
+const int SCAN_TIME = 5; // Scan for 5 seconds at a time
+
+// Colors
+uint32_t COLOR_BLE    = Adafruit_NeoPixel::Color(0, 0, 255);   // Blue Flash
+uint32_t COLOR_SERVER = Adafruit_NeoPixel::Color(255, 255, 255); // White Solid
 
 // ================= GLOBALS =================
-std::set<String> macsInRam;       
+Adafruit_NeoPixel pixels(NUM_PIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+WebServer server(80);
+BLEScan* pBLEScan;
+
+std::set<String> foundDevices; 
+bool isServerMode = false;
 unsigned long lastSaveTime = 0;
-unsigned long lastStatusTime = 0;
-unsigned long lastChannelHop = 0;
+unsigned long lastButtonPress = 0;
+
+// LED Vars
+bool triggerLed = false;
 
 // ================= HELPERS =================
 
 void initFS() {
-  if (!LittleFS.begin(true)) {
-    Serial.println("Error mounting LittleFS");
-  } else {
-    Serial.println("Storage Mounted.");
-  }
-}
-
-String formatTime(unsigned long m) {
-  unsigned long seconds = m / 1000;
-  unsigned long minutes = seconds / 60;
-  unsigned long hours = minutes / 60;
-  char buf[20];
-  snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu", hours, minutes % 60, seconds % 60);
-  return String(buf);
-}
-
-void printStatus() {
-   float tempC = temperatureRead();
-   uint32_t freeRam = ESP.getFreeHeap();
-   unsigned long uptime = millis() / 1000;
-   
-   Serial.println("\n--- SYSTEM STATUS ---");
-   Serial.printf("Time           : %s\n", formatTime(millis()).c_str());
-   Serial.printf("Current Buffer : %d unique devices\n", macsInRam.size());
-   Serial.printf("Chip Temp      : %.1f C\n", tempC);
-   Serial.printf("Free RAM       : %u bytes\n", freeRam);
-   Serial.println("---------------------");
+  if (!LittleFS.begin(true)) Serial.println("FS Mount Failed");
+  else Serial.println("Storage Mounted.");
 }
 
 void saveToStorage(unsigned long timestamp, int count) {
   File file = LittleFS.open(DATA_PATH, FILE_APPEND);
-  if (!file) {
-    Serial.println("Error: Could not open file to save.");
-    return;
-  }
+  if (!file) return;
   file.printf("%lu,%d\n", timestamp, count);
   file.close();
-
-  // Print specific 'Saved' message separate from standard status
-  float tempC = temperatureRead();
-  uint32_t freeRam = ESP.getFreeHeap();
-  Serial.printf(">> STORAGE SAVED: %s | Devices: %d | Temp: %.1fC | Free RAM: %u\n", 
-                formatTime(timestamp).c_str(), count, tempC, freeRam);
+  Serial.printf(">> SAVED to Storage: %d devices\n", count);
 }
 
-// ================= SERIAL COMMANDS =================
+// ================= BLE CALLBACK =================
+class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice advertisedDevice) {
+      // Get the MAC Address
+      String address = String(advertisedDevice.getAddress().toString().c_str());
+      
+      // If this is a NEW device we haven't seen in this 15-min block
+      if (foundDevices.find(address) == foundDevices.end()) {
+        foundDevices.insert(address);
+        Serial.printf("Found: %s (RSSI: %d)\n", address.c_str(), advertisedDevice.getRSSI());
+        
+        // Flash LED Blue immediately
+        pixels.setPixelColor(0, COLOR_BLE);
+        pixels.show();
+        delay(50); // Short blocking delay is okay in BLE callbacks
+        pixels.setPixelColor(0, 0); 
+        pixels.show();
+      }
+    }
+};
 
-void printGraph() {
-  if (!LittleFS.exists(DATA_PATH)) {
-    Serial.println("No data found.");
-    return;
-  }
+// ================= WEB SERVER =================
 
+String buildHtmlGraph() {
+  if (!LittleFS.exists(DATA_PATH)) return "<h3>No Data Found.</h3>";
+  
   File file = LittleFS.open(DATA_PATH, FILE_READ);
-  Serial.println("\n=== 15-MINUTE OCCUPANCY LOG ===");
-  Serial.println("Time (Boot) | Count | Graph");
-  Serial.println("-----------------------------------");
+  String dataPoints = "";
+  int maxVal = 1;
+  int x = 0;
 
+  // Pass 1: Get Max
   while (file.available()) {
     String line = file.readStringUntil('\n');
-    int commaIndex = line.indexOf(',');
-    if (commaIndex > 0) {
-      unsigned long ts = line.substring(0, commaIndex).toInt();
-      int count = line.substring(commaIndex + 1).toInt();
-      
-      String bar = "";
-      int visualCount = (count > 60) ? 60 : count; 
-      for (int i = 0; i < visualCount; i++) bar += "=";
-      
-      Serial.printf("%s    | %-5d | %s\n", formatTime(ts).c_str(), count, bar.c_str());
+    int comma = line.indexOf(',');
+    if (comma > 0) {
+      int val = line.substring(comma + 1).toInt();
+      if (val > maxVal) maxVal = val;
     }
   }
-  Serial.println("===================================\n");
-  file.close();
-}
+  file.seek(0); 
 
-void dumpCSV() {
-  if (!LittleFS.exists(DATA_PATH)) return;
-  File file = LittleFS.open(DATA_PATH, FILE_READ);
-  Serial.println("--- CSV START ---");
-  while(file.available()) Serial.write(file.read());
-  Serial.println("\n--- CSV END ---");
-  file.close();
-}
-
-void clearData() {
-  LittleFS.remove(DATA_PATH);
-  Serial.println("Storage cleared.");
-}
-
-// ================= WIFI SNIFFER =================
-
-void promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
-  if (ESP.getFreeHeap() < 10000) return; // Safety cutoff
-
-  wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
-  uint8_t* payload = pkt->payload;
-  uint8_t frame_ctrl = payload[0];
-
-  // Management Frame check (Probe Request is Subtype 4)
-  if ((frame_ctrl & 0x0C) == 0x00) { 
-    char macStr[18];
-    snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
-             payload[10], payload[11], payload[12],
-             payload[13], payload[14], payload[15]);
-    macsInRam.insert(String(macStr));
+  // Pass 2: Build Points
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    int comma = line.indexOf(',');
+    if (comma > 0) {
+      int val = line.substring(comma + 1).toInt();
+      int y = 200 - map(val, 0, maxVal, 0, 200); 
+      dataPoints += String(x) + "," + String(y) + " ";
+      x += 10; 
+    }
   }
+  file.close();
+
+  String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:sans-serif;text-align:center;padding:20px;background:#222;color:#fff;}";
+  html += ".box{background:#333;padding:20px;border-radius:10px;margin-bottom:20px;}";
+  html += "svg{background:#444;border-radius:5px;border:1px solid #555;}</style></head><body>";
+  html += "<h1>Bluetooth Device History</h1>";
+  html += "<div class='box'><div style='overflow-x:scroll'><svg width='" + String(x < 300 ? 300 : x) + "' height='210'>";
+  html += "<polyline points='" + dataPoints + "' style='fill:none;stroke:#00aaff;stroke-width:3' />";
+  html += "</svg></div><p>Peak: " + String(maxVal) + " Devices</p></div>";
+  html += "<div class='box'><p><a href='/clear' style='color:#f55'>Clear Data</a></p></div></body></html>";
+  return html;
+}
+
+void handleRoot() { server.send(200, "text/html", buildHtmlGraph()); }
+void handleClear() { LittleFS.remove(DATA_PATH); server.send(200, "text/html", "Cleared <a href='/'>Back</a>"); }
+
+// ================= MODE SWITCHING =================
+
+void startSnifferMode() {
+  Serial.println(">>> MODE: BLUETOOTH SNIFFER");
+  isServerMode = false;
+  
+  // Turn OFF WiFi to save power/radio
+  WiFi.mode(WIFI_OFF);
+  
+  // Init BLE
+  BLEDevice::init("");
+  pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setActiveScan(true); 
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99); 
+  
+  pixels.setPixelColor(0, 0); pixels.show();
+}
+
+void startServerMode() {
+  Serial.println(">>> MODE: WIFI SERVER");
+  isServerMode = true;
+
+  // Stop BLE to free up radio for WiFi
+  BLEDevice::deinit(); 
+  
+  WiFi.softAP(WIFI_SSID, WIFI_PASS);
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/clear", handleClear);
+  server.begin();
+
+  pixels.setPixelColor(0, COLOR_SERVER);
+  pixels.show();
+}
+
+void toggleMode() {
+  if (isServerMode) startSnifferMode();
+  else startServerMode();
 }
 
 // ================= SETUP & LOOP =================
 
 void setup() {
   Serial.begin(115200);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  
+  pixels.begin();
+  pixels.setBrightness(BRIGHTNESS);
   initFS();
 
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  esp_wifi_set_promiscuous(true);
-  esp_wifi_set_promiscuous_rx_cb(&promiscuous_rx_cb);
-
-  Serial.println("System Started.");
-  printStatus(); // Print initial status
-  Serial.println("Commands: 'graph', 'csv', 'clear', 'status'");
-  
-  lastSaveTime = millis();
-  lastStatusTime = millis();
+  startSnifferMode();
 }
 
 void loop() {
   unsigned long currentMillis = millis();
 
-  // 1. Channel Hopping (Every 250ms)
-  if (currentMillis - lastChannelHop > 250) {
-    lastChannelHop = currentMillis;
-    int ch = (currentMillis / 250) % 13 + 1;
-    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  // Button Check
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    delay(50);
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      if (currentMillis - lastButtonPress > 1000) { // 1 sec debounce
+        toggleMode();
+        lastButtonPress = currentMillis;
+      }
+    }
   }
 
-  // 2. Scheduled Status Print (Every 2 Mins)
-  if (currentMillis - lastStatusTime >= STATUS_INTERVAL_MS) {
-    printStatus();
-    lastStatusTime = currentMillis;
-  }
-
-  // 3. Storage Save (Every 15 Mins)
-  if (currentMillis - lastSaveTime >= SAVE_INTERVAL_MS) {
-    int count = macsInRam.size();
-    saveToStorage(currentMillis, count);
-    macsInRam.clear(); // Reset buffer
-    lastSaveTime = currentMillis;
-  }
-
-  // 4. Serial Inputs
-  if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    if (cmd == "graph") printGraph();
-    else if (cmd == "csv") dumpCSV();
-    else if (cmd == "clear") clearData();
-    else if (cmd == "status") printStatus();
+  if (isServerMode) {
+    server.handleClient();
+    delay(5);
+  } 
+  else {
+    // BLE MODE: Scan for X seconds
+    // This is blocking, but that's fine for a simple counter
+    // CORRECTED: Just run the scan and ignore the return variable
+    pBLEScan->start(SCAN_TIME, false);
+    pBLEScan->clearResults(); // delete results from RAM to free memory
+    
+    // Save Data Check
+    if (currentMillis - lastSaveTime >= SAVE_INTERVAL_MS) {
+      int count = foundDevices.size();
+      saveToStorage(currentMillis, count);
+      foundDevices.clear(); // Reset buffer for next 15 mins
+      lastSaveTime = currentMillis;
+    }
   }
 }
