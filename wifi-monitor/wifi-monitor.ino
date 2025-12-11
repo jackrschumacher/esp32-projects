@@ -4,6 +4,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <FS.h>
 #include <LittleFS.h>
+#include <WebServer.h> // NEW: Required for the Web Interface
 
 // --- HARDWARE CONFIG ---
 #define RGB_PIN 48  
@@ -15,14 +16,20 @@
 #define LOG_INTERVAL_MS 900000       // Save to File every 15 Minutes
 #define CALIBRATION_INTERVAL_MS 60000 // Learn Environment every 1 Minute
 
+// --- AP CONFIG (NEW) ---
+const char* ap_ssid = "jsESP32-Wifi";
+const char* ap_pass = "StarshipFalcon9#";
+
 // --- OBJECTS ---
 Adafruit_NeoPixel pixels(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
+WebServer server(80); // NEW: Web Server on port 80
 
 // --- VARIABLES ---
-volatile int packetCount = 0;      
+volatile int packetCount = 0;       
+bool inAPMode = false; // NEW: Tracks system state
 
 // Separate accumulators for Learning vs Logging
-unsigned long minuteTotalPackets = 0;      
+unsigned long minuteTotalPackets = 0;       
 unsigned long fifteenMinuteTotalPackets = 0; 
 
 // --- SMART HISTORY BUFFER (Last 15 Minutes) ---
@@ -42,88 +49,110 @@ int fadeSpeed = 5;
 // --- TIMERS ---
 unsigned long lastTrafficCheck = 0;
 unsigned long lastFadeUpdate = 0;
-unsigned long lastCalibrationTime = 0; // Timer 1 (Learning)
-unsigned long lastLogTime = 0;         // Timer 2 (Logging)
+unsigned long lastCalibrationTime = 0; 
+unsigned long lastLogTime = 0;         
 
 // Sniffer Callback
 void promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
   packetCount++;
 }
 
-// --- SMART CALIBRATION FUNCTION ---
-void calibrateThresholds() {
-  if (historyIndex == 0 && !historyFull) return;
-
-  long minVal = 999999;
-  long maxVal = 0;
-  int count = historyFull ? 15 : historyIndex;
-
-  for (int i = 0; i < count; i++) {
-    if (history[i] < minVal) minVal = history[i];
-    if (history[i] > maxVal) maxVal = history[i];
-  }
-
-  if (maxVal - minVal < 50) maxVal = minVal + 50; 
-
-  dynamicLow = minVal + ((maxVal - minVal) * 0.33);
-  dynamicHigh = minVal + ((maxVal - minVal) * 0.66);
-}
-
-// --- REPORT GENERATOR ---
-void generateReport() {
-  if (!LittleFS.exists("/traffic_log.txt")) {
-    Serial.println("No logs found yet.");
-    return;
-  }
-
+// --- WEB HANDLERS (NEW) ---
+void handleRoot() {
   File file = LittleFS.open("/traffic_log.txt", "r");
-  if (!file) return;
-
-  // PASS 1: Find Max for scaling
-  long maxPackets = 1; 
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    if (line.length() < 2) continue;
-    int comma = line.indexOf(',');
-    if (comma > 0) {
-      String valStr = line.substring(comma + 1);
-      long val = valStr.toInt();
-      if (val > maxPackets) maxPackets = val;
+  String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:sans-serif; text-align:center;} table{margin:auto; border-collapse: collapse;} td, th {border: 1px solid #ddd; padding: 8px;}</style>";
+  html += "</head><body><h1>Traffic Logs</h1>";
+  
+  if (!file || !file.available()) {
+    html += "<p>No logs found.</p>";
+  } else {
+    html += "<table><tr><th>Time (sec)</th><th>Avg Packets</th></tr>";
+    while (file.available()) {
+      String line = file.readStringUntil('\n');
+      if (line.length() > 0) {
+        int comma = line.indexOf(',');
+        if (comma > 0) {
+           html += "<tr><td>" + line.substring(0, comma) + "</td><td>" + line.substring(comma+1) + "</td></tr>";
+        }
+      }
     }
+    html += "</table>";
+    file.close();
   }
-  file.close(); 
-
-  // PASS 2: Print Graph
-  file = LittleFS.open("/traffic_log.txt", "r");
-  Serial.println("\n\n===== TRAFFIC HISTORY GRAPH (15m Intervals) =====");
-  Serial.printf("Scale: 100%% = %ld packets/sec (avg)\n", maxPackets);
-  Serial.println("-------------------------------------------------");
-
-  int lineCount = 1;
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    if (line.length() < 2) continue;
-    
-    int comma = line.indexOf(',');
-    if (comma > 0) {
-      String valStr = line.substring(comma + 1);
-      long val = valStr.toInt();
-      int barLength = (int)((val * 50) / maxPackets);
-      
-      Serial.printf("%03d |", lineCount++);
-      for (int i = 0; i < barLength; i++) Serial.print("#");
-      Serial.printf(" (%ld)\n", val);
-    }
-  }
-  Serial.println("=================================================\n");
-  file.close();
+  
+  html += "<br><br><form action='/clear' method='get'><button style='background:red;color:white;padding:10px;'>CLEAR LOGS</button></form>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
 }
 
+void handleClear() {
+  LittleFS.remove("/traffic_log.txt");
+  server.send(200, "text/html", "Logs cleared! <a href='/'>Go Back</a>");
+}
+
+// --- HELPER FUNCTIONS ---
 void appendFile(const char * path, String message){
   File file = LittleFS.open(path, FILE_APPEND);
   if(!file) return;
   file.print(message);
   file.close();
+}
+
+void calibrateThresholds() {
+  if (historyIndex == 0 && !historyFull) return;
+  long minVal = 999999;
+  long maxVal = 0;
+  int count = historyFull ? 15 : historyIndex;
+  for (int i = 0; i < count; i++) {
+    if (history[i] < minVal) minVal = history[i];
+    if (history[i] > maxVal) maxVal = history[i];
+  }
+  if (maxVal - minVal < 50) maxVal = minVal + 50; 
+  dynamicLow = minVal + ((maxVal - minVal) * 0.33);
+  dynamicHigh = minVal + ((maxVal - minVal) * 0.66);
+}
+
+// --- STATE MANAGEMENT (NEW) ---
+void enableAPMode() {
+  Serial.println("Switching to AP Mode...");
+  
+  // 1. Stop Sniffer
+  esp_wifi_set_promiscuous(false);
+  
+  // 2. Start AP
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ap_ssid, ap_pass);
+  Serial.print("AP IP Address: ");
+  Serial.println(WiFi.softAPIP());
+
+  // 3. Start Server
+  server.on("/", handleRoot);
+  server.on("/clear", handleClear);
+  server.begin();
+  
+  // 4. Visual Indicator (Cyan)
+  pixels.setPixelColor(0, pixels.Color(0, 255, 255));
+  pixels.show();
+  
+  inAPMode = true;
+}
+
+void disableAPMode() {
+  Serial.println("Switching back to Sniffer Mode...");
+  
+  // 1. Stop Server & AP
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  
+  // 2. Restart Sniffer
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(promiscuous_rx_cb);
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  
+  inAPMode = false;
 }
 
 void setup() {
@@ -141,17 +170,11 @@ void setup() {
   pixels.setBrightness(20);
   pixels.show();
 
-  // Initialize History Buffer with 0
+  // Initialize History Buffer
   for(int i=0; i<15; i++) history[i] = 0;
 
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  esp_wifi_set_promiscuous(true);
-  esp_wifi_set_promiscuous_rx_cb(promiscuous_rx_cb);
-  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
-
-  Serial.println("--- Wifi Packet monitor ---");
-  Serial.println("Commands: 'graph', 'thresholds', 'system'");
+  // Start in Sniffer Mode
+  disableAPMode(); 
   
   lastLogTime = millis();
   lastCalibrationTime = millis();
@@ -160,84 +183,71 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
 
-  // --- 1. SERIAL COMMAND LISTENER ---
-  if (Serial.available()) {
-    String command = Serial.readStringUntil('\n');
-    command.trim(); 
-    
-    if (command.equalsIgnoreCase("graph")) {
-      pixels.setPixelColor(0, pixels.Color(0, 0, 255)); 
-      pixels.show();
-      generateReport();
-    }
-    else if (command.equalsIgnoreCase("thresholds")) {
-      Serial.printf("Low < %ld | High > %ld\n", dynamicLow, dynamicHigh );
-    }
-    else if (command.equalsIgnoreCase("system")) {
-      uint32_t freeHeap = ESP.getFreeHeap();
-      float cpuTemp = temperatureRead();
-      uint32_t usedBytes = LittleFS.usedBytes();
-      uint32_t totalBytes = LittleFS.totalBytes();
-      float storagePercent = (float)usedBytes / totalBytes * 100;
-      Serial.printf("Temp:%.1f C, FreeRAM:%.1f KB, Storage:%.1f%%\n", 
-                    cpuTemp, freeHeap/ 1024.0, storagePercent);
-    }
-  }
-
-  // --- 2. BUTTON LISTENER ---
+  // --- BUTTON HANDLING (Toggle Mode) ---
+  // Simple debounce logic
   if (digitalRead(BUTTON_PIN) == LOW) {
     delay(50); 
     if (digitalRead(BUTTON_PIN) == LOW) {
-      pixels.setPixelColor(0, pixels.Color(0, 0, 255)); 
-      pixels.show();
-      generateReport();
+      if (inAPMode) {
+        disableAPMode();
+      } else {
+        enableAPMode();
+      }
+      // Wait for release to prevent cycling
       while(digitalRead(BUTTON_PIN) == LOW) delay(10);
     }
   }
 
-  // --- 3. FAST TIMER: CALIBRATION (Every 1 Minute) ---
-  if (currentMillis - lastCalibrationTime > CALIBRATION_INTERVAL_MS) {
-    long minuteAvg = minuteTotalPackets / 60; // Avg packets per second this minute
+  // --- MODE 1: ACCESS POINT (VIEW DATA) ---
+  if (inAPMode) {
+    server.handleClient();
+    // In AP mode, we skip all sniffing and logging logic
+    // Just pulse the LED gently to show we are alive
+    int b = (millis() / 10) % 255; 
+    if (b>127) b = 255 - b; // Triangle wave for breathing effect
+    pixels.setPixelColor(0, pixels.Color(0, b*2, b*2)); // Cyan Breathe
+    pixels.show();
+    return; 
+  }
 
-    // Update History
+  // --- MODE 2: SNIFFER (COLLECT DATA) ---
+
+  // ... (Standard Sniffer Logic) ...
+  
+  // 1. FAST TIMER: CALIBRATION (Every 1 Minute)
+  if (currentMillis - lastCalibrationTime > CALIBRATION_INTERVAL_MS) {
+    long minuteAvg = minuteTotalPackets / 60; 
     history[historyIndex] = minuteAvg;
     historyIndex++;
     if (historyIndex >= 15) {
       historyIndex = 0; 
       historyFull = true;
     }
-
-    // Recalculate Thresholds based on recent history
     calibrateThresholds();
-
     minuteTotalPackets = 0;
     lastCalibrationTime = currentMillis;
   }
 
-  // --- 4. SLOW TIMER: LOGGING (Every 15 Minutes) ---
+  // 2. SLOW TIMER: LOGGING (Every 15 Minutes)
   if (currentMillis - lastLogTime > LOG_INTERVAL_MS) {
     long fifteenMinAvg = fifteenMinuteTotalPackets / (LOG_INTERVAL_MS / 1000);
-
     String logEntry = String(millis()/1000) + "," + String(fifteenMinAvg) + "\n";
     appendFile("/traffic_log.txt", logEntry);
-
     fifteenMinuteTotalPackets = 0;
     lastLogTime = currentMillis;
   }
 
-  // --- 5. LIVE LOOP (Every 1 Sec) ---
+  // 3. LIVE LOOP (Every 1 Sec)
   if (currentMillis - lastTrafficCheck > 1000) {
     int currentPackets = packetCount; 
     packetCount = 0; 
     
-    // Add to BOTH accumulators
     minuteTotalPackets += currentPackets;
     fifteenMinuteTotalPackets += currentPackets;
 
-    // Print with Newline for clean output
-    Serial.printf("Traffic:%d\n", currentPackets);
+    Serial.printf("Traffic:%d pckts/sec \n", currentPackets);
 
-    // Adaptive LED Logic using Dynamic Thresholds
+    // Adaptive LED Logic
     if (currentPackets == 0) {
       targetR = 0; targetG = 0; targetB = 0;
     } 
@@ -250,11 +260,10 @@ void loop() {
     else {
       targetR = 255; targetG = 0; targetB = 0; 
     }
-
     lastTrafficCheck = currentMillis;
   }
 
-  // --- 6. ANIMATION ---
+  // 4. ANIMATION
   if (currentMillis - lastFadeUpdate > 10) {
     if (currentR < targetR) currentR += fadeSpeed;
     if (currentR > targetR) currentR -= fadeSpeed;
