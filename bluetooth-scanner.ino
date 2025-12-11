@@ -10,12 +10,12 @@
 #include <Adafruit_NeoPixel.h>
 
 // ================= CONFIGURATION =================
-const char* WIFI_SSID = "ESP32_BLE_Counter";
-const char* WIFI_PASS = "12345678";
+const char* WIFI_SSID = "jsESP32-BLE";
+const char* WIFI_PASS = "ESPBluetoothPassword11#";
 const char* DATA_PATH = "/ble_readings.txt";
 
 // --- HARDWARE ---
-#define NEOPIXEL_PIN  48  
+#define NEOPIXEL_PIN  48  // (Set to 48 if using S3-DevKitC)
 #define NUM_PIXELS    1
 #define BRIGHTNESS    20
 #define BUTTON_PIN    0   
@@ -203,7 +203,6 @@ void loop() {
   else {
     // BLE MODE: Scan for X seconds
     // This is blocking, but that's fine for a simple counter
-    // CORRECTED: Just run the scan and ignore the return variable
     pBLEScan->start(SCAN_TIME, false);
     pBLEScan->clearResults(); // delete results from RAM to free memory
     
