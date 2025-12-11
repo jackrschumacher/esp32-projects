@@ -11,7 +11,7 @@
 
 // ================= CONFIGURATION =================
 const char* WIFI_SSID = "jsESP32-BLE";
-const char* WIFI_PASS = "ESPBluetoothPassword11#";
+const char* WIFI_PASS = "ESP32BluetoothPassword12#";
 const char* DATA_PATH = "/ble_readings.txt";
 
 // --- HARDWARE ---
@@ -36,10 +36,10 @@ BLEScan* pBLEScan;
 std::set<String> foundDevices; 
 bool isServerMode = false;
 unsigned long lastSaveTime = 0;
-unsigned long lastButtonPress = 0;
 
-// LED Vars
-bool triggerLed = false;
+// INTERRUPT VARIABLES (Volatile is required for ISRs)
+volatile bool buttonWasPressed = false;
+unsigned long lastButtonPressTime = 0;
 
 // ================= HELPERS =================
 
@@ -56,21 +56,24 @@ void saveToStorage(unsigned long timestamp, int count) {
   Serial.printf(">> SAVED to Storage: %d devices\n", count);
 }
 
+// ================= BUTTON INTERRUPT =================
+// This runs immediately when button is pressed, even during scanning
+void IRAM_ATTR handleButtonPress() {
+  buttonWasPressed = true;
+}
+
 // ================= BLE CALLBACK =================
 class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice advertisedDevice) {
-      // Get the MAC Address
       String address = String(advertisedDevice.getAddress().toString().c_str());
       
-      // If this is a NEW device we haven't seen in this 15-min block
       if (foundDevices.find(address) == foundDevices.end()) {
         foundDevices.insert(address);
-        Serial.printf("Found: %s (RSSI: %d)\n", address.c_str(), advertisedDevice.getRSSI());
         
-        // Flash LED Blue immediately
+        // Flash LED Blue
         pixels.setPixelColor(0, COLOR_BLE);
         pixels.show();
-        delay(50); // Short blocking delay is okay in BLE callbacks
+        delay(10); // Very short delay
         pixels.setPixelColor(0, 0); 
         pixels.show();
       }
@@ -132,10 +135,8 @@ void startSnifferMode() {
   Serial.println(">>> MODE: BLUETOOTH SNIFFER");
   isServerMode = false;
   
-  // Turn OFF WiFi to save power/radio
   WiFi.mode(WIFI_OFF);
   
-  // Init BLE
   BLEDevice::init("");
   pBLEScan = BLEDevice::getScan();
   pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
@@ -150,7 +151,6 @@ void startServerMode() {
   Serial.println(">>> MODE: WIFI SERVER");
   isServerMode = true;
 
-  // Stop BLE to free up radio for WiFi
   BLEDevice::deinit(); 
   
   WiFi.softAP(WIFI_SSID, WIFI_PASS);
@@ -175,6 +175,9 @@ void setup() {
   Serial.begin(115200);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   
+  // ATTACH INTERRUPT (Fix for unreliable button)
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonPress, FALLING);
+  
   pixels.begin();
   pixels.setBrightness(BRIGHTNESS);
   initFS();
@@ -185,32 +188,37 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
 
-  // Button Check
-  if (digitalRead(BUTTON_PIN) == LOW) {
-    delay(50);
-    if (digitalRead(BUTTON_PIN) == LOW) {
-      if (currentMillis - lastButtonPress > 1000) { // 1 sec debounce
-        toggleMode();
-        lastButtonPress = currentMillis;
-      }
+  // --- 1. HANDLE BUTTON PRESS ---
+  // If the ISR flag was set, toggle mode
+  if (buttonWasPressed) {
+    // Basic debounce (ignore presses within 1 second of each other)
+    if (currentMillis - lastButtonPressTime > 1000) {
+      toggleMode();
+      lastButtonPressTime = currentMillis;
     }
+    buttonWasPressed = false; // Reset flag
   }
 
+  // --- 2. SERVER MODE ---
   if (isServerMode) {
     server.handleClient();
     delay(5);
   } 
+  
+  // --- 3. BLUETOOTH MODE ---
   else {
-    // BLE MODE: Scan for X seconds
-    // This is blocking, but that's fine for a simple counter
+    // Scan for 5 seconds (Blocking)
+    // IMPORTANT: Removing the "BLEScanResults found =" fixed your compilation error
     pBLEScan->start(SCAN_TIME, false);
-    pBLEScan->clearResults(); // delete results from RAM to free memory
     
-    // Save Data Check
+    // Clean up RAM
+    pBLEScan->clearResults(); 
+    
+    // Save to storage if time is up
     if (currentMillis - lastSaveTime >= SAVE_INTERVAL_MS) {
       int count = foundDevices.size();
       saveToStorage(currentMillis, count);
-      foundDevices.clear(); // Reset buffer for next 15 mins
+      foundDevices.clear(); 
       lastSaveTime = currentMillis;
     }
   }
