@@ -18,7 +18,7 @@
 
 // --- AP CONFIG (NEW) ---
 const char* ap_ssid = "jsESP32-Wifi";
-const char* ap_pass = "StarshipFalcon9#";
+const char* ap_pass = "ESPWifiPassword11";
 
 // --- OBJECTS ---
 Adafruit_NeoPixel pixels(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
